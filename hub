@@ -1,0 +1,348 @@
+#include <FastLED.h>
+#include "BluetoothSerial.h"
+#include <string>
+
+#define LED_TYPE WS2812B
+#define DATA_PIN 15
+#define COLOUR_ORDER GRB
+#define NUM_LEDS 300
+#define MAX_BRIGHTNESS 255
+
+#define COOLING 6
+#define TWINKLING 150
+#define FLICKER 140
+#define FRAMES_PER_SECOND 35
+
+#define ALL_RAINBOW false
+
+BluetoothSerial SerialBT;
+TaskHandle_t receiveTask;
+TaskHandle_t regularOperation;
+
+CRGB leds[NUM_LEDS];
+
+int incoming;
+bool changedData = false;
+
+static uint8_t heat[150][3];
+long deltaTimeTwinkle = 0;
+long nextTwinkle = 0;
+unsigned int seeds = 0; 
+long int time1 = 0;
+int temp;
+float x;
+
+String theme = "0,0"; //0,0 = fire, 0,1 = ocean, 0,2 = rainbow
+String state = "themes"; // what state is the program currently in
+
+CHSV TwinkleColour(int temperature, int j) {
+  CHSV heatcolour;
+  
+  if(ALL_RAINBOW == true) {
+      heatcolour.hue = x;
+      x += 0.0005;
+      heatcolour.saturation = 255;
+      heatcolour.value = temperature;
+      return heatcolour;
+  } else {
+      heatcolour.hue = heat[j][2];
+      heatcolour.saturation = 255;
+      heatcolour.value = temperature;
+      return heatcolour;  
+    }
+}
+
+typedef struct {
+  int stripNum;
+  int stripMode;
+  int hsv[3];
+  int themeType; // flicker, bounce, colourfade
+  int themeColour; // flicker: fire, ocean, rainbow...  bounce: todo...  colourfade: todo
+  char values[2];
+} DataToStrips;
+
+typedef struct {
+  int stripMode;
+  int themeType;
+  int themeColour;
+  int stripNum;
+  int hue;
+  int sat;
+  int bright;
+} FullColour;
+
+struct colour_palettes {
+  int fire[2][1] = {{0}, {35}};
+  int ocean[2][1] = {{110}, {190}};
+  int rainbow[2][1] = {{0}, {255}};
+} colour_palettes;
+
+typedef enum {
+  READ_STRIP_TYPE,
+  READ_MODE,
+  READ_MODE_DATA,
+  READ_COLOUR,
+  READ_END
+} ReadType;
+
+DataToStrips dataToStrips;
+DataToStrips dataCpy;
+
+ReadType check_message(int incoming, int count, DataToStrips* transmitData, ReadType readType);
+FullColour analyseData();
+
+void setup() {
+  Serial.begin(115200);
+  SerialBT.begin("ESP32hub");
+  pinMode(2, OUTPUT);
+  FastLED.addLeds<LED_TYPE, DATA_PIN, COLOUR_ORDER>(leds, NUM_LEDS);
+  
+  xTaskCreatePinnedToCore(receiver, "receiveTask", 10000, NULL, 1, &receiveTask, 1);
+  delay(500);
+  xTaskCreatePinnedToCore(main_task, "regularOperation", 10000, NULL, 1, &regularOperation, 0); 
+  delay(500);
+}
+
+void receiver(void* parameters) {
+  ReadType readType = READ_STRIP_TYPE;
+  ReadType previousRead = READ_STRIP_TYPE;
+  int count = 0;
+  for(;;) {
+    
+    if (SerialBT.available()) { //Check if we receive anything from Bluetooth
+
+      incoming = SerialBT.read(); //Read what we recevive 
+      Serial.print("Received:"); 
+      Serial.println(incoming);
+      SerialBT.println(incoming);
+
+      
+      if (incoming == 10) {
+        changedData = true;
+        dataCpy = dataToStrips; // used copy
+        delay(10);
+        dataToStrips = {}; //reset data 
+        count = 0;
+        readType = READ_STRIP_TYPE;
+        continue;
+      }
+      
+      readType = check_message(incoming, count, &dataToStrips, readType);
+      if (readType != previousRead) {
+        count = 0;
+        previousRead = readType;
+      } else {
+        count++;
+      }
+    vTaskDelay(30);
+    }
+  }
+}
+
+ReadType check_message(int incoming, int count, DataToStrips* transmitData, ReadType readType) {
+  char temp;
+  char colour[5];
+  
+  if (readType == READ_STRIP_TYPE) {
+    temp = (char) incoming;
+    transmitData->stripNum = temp - '0';
+    return READ_MODE;
+    
+  } else if (readType == READ_MODE) {
+    temp = (char) incoming;
+    transmitData->stripMode = temp - '0';
+    return READ_MODE_DATA;
+    
+  } else if (readType == READ_MODE_DATA) {
+    if (transmitData->stripMode == 0) {
+      temp = (char) incoming;
+      transmitData->themeType = temp - '0';
+    }
+    // temporarily ignoring
+    return READ_COLOUR;
+    
+  } else if (readType == READ_COLOUR) {
+    
+    if (transmitData->stripMode == 0) { // theme colour (first digit of the 6 colour values)
+      temp = (char) incoming;
+      transmitData->themeColour = temp - '0';
+      Serial.print("themeColour: ");
+      Serial.println(transmitData->themeColour);
+      return READ_END;
+      
+    } else if (transmitData->stripMode == 1) { //full colour
+      temp = (char) incoming;
+      
+      if (count == 0 || count == 1) {
+          transmitData->values[count] = temp;
+          
+      } else if (count == 2 || count == 3) {
+        if (count == 2) {
+          colour[0] = transmitData->values[0];
+          colour[1] = transmitData->values[1];
+          transmitData->hsv[0] = str_to_hex(colour); // hue
+        }
+        transmitData->values[count - 2] = temp;
+        
+      } else if (count == 4 || count == 5) {
+        if (count == 4) {
+          colour[0] = transmitData->values[0];
+          colour[1] = transmitData->values[1];
+          transmitData->hsv[1] = str_to_hex(colour);// saturation
+        }      
+        transmitData->values[count - 4] = temp;
+        
+      } else if (count == 6 || count == 7) {
+        colour[0] = transmitData->values[0];
+        colour[1] = transmitData->values[1];
+        transmitData->hsv[2] = str_to_hex(colour);// brightness
+        if (count == 6) {
+           return READ_END;
+        }
+      }
+      return readType;
+    }
+  }
+}
+
+int str_to_hex(char str[]) {
+  return (int) strtol(str, 0, 16);
+}
+
+void main_task(void* parameters) {
+  
+  char printThing[100];
+  sprintf(printThing, "0stripNum: %d, mode: %d, hue: %d, sat: %d, brightness: %d", dataCpy.stripNum, dataCpy.stripMode, dataCpy.hsv[0], 
+      dataCpy.hsv[1], dataCpy.hsv[2]);
+  Serial.println(printThing);
+  delay(1000);
+
+  FullColour values;
+  
+  for(;;) {
+
+    if (changedData == true) {
+      values = analyseData();
+      char printThing[100];
+      sprintf(printThing, "1stripNum: %d, mode: %d, type: %d, colour: %d", values.stripNum, values.stripMode, values.themeType, values.themeColour);
+      Serial.println(printThing);      
+      changedData = false;
+      if (values.stripMode == 0) {
+        if (values.themeType == 0) {
+          switch (values.themeColour) {
+            case 0: 
+              theme = "0,0"; //fire 
+              break;
+            case 1:
+              theme = "0,1"; //ocean
+              break;
+            case 2:
+              theme = "0,2"; //rainbow
+              break;
+          }
+          Serial.println(theme);
+          for(int i = 0; i < NUM_LEDS; i++) {
+            heat[i][0] = 0;
+            heat[i][1] = 0;
+          }
+        }
+      } else if (values.stripMode == 1) {
+        fill_solid(leds, NUM_LEDS, CHSV(values.hue, values.sat, values.bright));
+      }
+    }
+
+    if (values.themeType == 0) {
+      deltaTimeTwinkle = millis() - nextTwinkle;
+      if(deltaTimeTwinkle > 0) {
+        Twinkle();
+      }
+    }
+    
+    FastLED.show();
+  }
+}
+
+FullColour analyseData() {
+
+  FullColour values;
+  
+  values.stripNum  = dataCpy.stripNum;
+  if (values.stripNum == 0) { // hub strip
+    values.stripMode = dataCpy.stripMode;
+    if (values.stripMode == 1) { //full colour
+      values.hue = dataCpy.hsv[0];
+      values.sat = dataCpy.hsv[1];
+      values.bright = dataCpy.hsv[2];
+    } else if (values.stripMode == 0) { //themes
+      values.themeType = dataCpy.themeType;
+      values.themeColour = dataCpy.themeColour;
+    }
+  }
+  return values;
+}
+
+void Twinkle() {
+  random16_add_entropy(esp_random());
+  seeds = random16(10, NUM_LEDS-10);
+  seeds = random16(10, NUM_LEDS-10);
+
+
+//CREATES RANDOM SEEDS
+  for(int j=0; j<seeds; j++) {
+    if(random16() < TWINKLING) {
+      random16_add_entropy(esp_random());
+      temp = random16(NUM_LEDS); // HERE
+      heat[temp][0] = random16(50,255);
+      heat[temp][1] = 1; 
+    }
+  }
+
+  
+//COOLS DOWN ALL LEDS
+  for(int i=0; i<NUM_LEDS; i++) {
+    heat[i][0] = qsub8(heat[i][0], COOLING);
+    if(heat[i][0] <= 0) {
+      heat[i][1] = 0;
+    }
+  }
+
+  
+//FLICKERS A RANDOM AMOUNT OF LEDS
+  for(int k=0; k<NUM_LEDS; k++) {
+    if(heat[k][0]>0 && random8()<FLICKER) {
+      heat[k][0] = qadd8(heat[k][0], 10);
+    }
+  }
+
+  
+//CHOOSES COLOUR OF EACH LED
+  for(int j=0; j<NUM_LEDS; j++) {
+    if(heat[j][1] == 0) {
+      if(theme == "0,0") {
+        heat[j][2] = random16(colour_palettes.fire[0][0], colour_palettes.fire[1][0]);
+      } else if(theme == "0,1") {
+        heat[j][2] = random16(colour_palettes.ocean[0][0], colour_palettes.ocean[1][0]);
+      } else if(theme == "0,2") {
+        heat[j][2] = random16(colour_palettes.rainbow[0][0], colour_palettes.rainbow[1][0]);
+      }
+      leds[j] = TwinkleColour(heat[j][0], j);
+      /*
+      if(module_size > 1) {
+        leds[j+(NUM_LEDS/module_size)] = TwinkleColour(heat[j][0], j);
+      }
+      */
+    } else {
+      leds[j] = TwinkleColour(heat[j][0], j);
+      /*
+      if(module_size > 1) {
+        leds[j+(NUM_LEDS)] = TwinkleColour(heat[j][0], j);
+      }
+      */
+    }
+  }
+  nextTwinkle += 10000/64;
+}
+
+void loop() {
+  
+}
